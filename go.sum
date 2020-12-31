@@ -6,6 +6,8 @@ github.com/diamondburned/arikawa v1.3.15-0.20201231081656-8c0b3fc3bdae h1:L7tNNv
 github.com/diamondburned/arikawa v1.3.15-0.20201231081656-8c0b3fc3bdae/go.mod h1:nIhVIatzTQhPUa7NB8w4koG1RF9gYbpAr8Fj8sKq660=
 github.com/diamondburned/arikawa v1.3.15-0.20201231090428-9f2889c75362 h1:DIYBLGScTlV5MGBqTBeq+R91ZP+7/6Jk6811Q7lpvLc=
 github.com/diamondburned/arikawa v1.3.15-0.20201231090428-9f2889c75362/go.mod h1:nIhVIatzTQhPUa7NB8w4koG1RF9gYbpAr8Fj8sKq660=
+github.com/diamondburned/arikawa v1.3.15-0.20201231092750-6c3becbdc5ef h1:paguxwqh4HvDBYJbSLXlQuLdvU3FwyoEoj2j9LAzmqw=
+github.com/diamondburned/arikawa v1.3.15-0.20201231092750-6c3becbdc5ef/go.mod h1:nIhVIatzTQhPUa7NB8w4koG1RF9gYbpAr8Fj8sKq660=
 github.com/diamondburned/arikawa/v2 v2.0.0-20201227001310-f3f075b27f44 h1:i6Jec7bvVY8NhwW3L0SlpfWM6r2p2i67XuhiOEzkfwI=
 github.com/diamondburned/arikawa/v2 v2.0.0-20201227001310-f3f075b27f44/go.mod h1:e+lhS20ni2luFEU06Pc8paCxgZL99/RZb77dOC82CF0=
 github.com/gorilla/schema v1.1.0 h1:CamqUDOFUBqzrvxuz2vEwo8+SUdwsluFh7IlzJh30LY=
