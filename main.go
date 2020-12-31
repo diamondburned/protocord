@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"flag"
 	"fmt"
 	"io"
@@ -10,6 +11,7 @@ import (
 	"time"
 
 	"github.com/chzyer/readline"
+	"github.com/diamondburned/arikawa/api"
 	"github.com/diamondburned/arikawa/discord"
 	"github.com/diamondburned/arikawa/gateway"
 	"github.com/diamondburned/arikawa/state"
@@ -95,7 +97,8 @@ func NewPrompt(s *state.State) (*Prompt, error) {
 
 		fmt.Fprintf(
 			p, "[%s] %s: %s\n",
-			msg.Timestamp.Format(time.Kitchen), name, msg.Content,
+			msg.Timestamp.Time().Local().Format(time.Kitchen),
+			name, msg.Content,
 		)
 	})
 
@@ -115,7 +118,8 @@ func NewPrompt(s *state.State) (*Prompt, error) {
 
 		fmt.Fprintf(
 			p, "[%s] %s: %s (edited)\n",
-			msg.EditedTimestamp.Format(time.Kitchen), name, msg.Content,
+			msg.EditedTimestamp.Time().Local().Format(time.Kitchen),
+			name, msg.Content,
 		)
 	})
 
@@ -146,12 +150,21 @@ func (p *Prompt) Run() error {
 
 		switch k {
 		case "help":
-			p.writeLine("Available commands: /list, /join [channelID].")
 			p.writeLine("To send a message, type in directly.")
+			p.writeLine("Available commands:")
+			p.writeLine("	/list")
+			p.writeLine("	/join <channelID>")
+			p.writeLine("	/join-invite <inviteCode>")
+			p.writeLine("	/create-invite [channelID] [json:createInviteData]")
+
 		case "list":
 			p.list()
 		case "join":
 			p.join(v)
+		case "join-invite":
+			p.joinInvite(v)
+		case "create-invite":
+			p.createInvite(v)
 		}
 	}
 }
@@ -225,11 +238,65 @@ func (p *Prompt) join(body string) {
 
 		fmt.Fprintf(
 			p, "[%s] %s: %s\n",
-			msg.Timestamp.Format(time.Kitchen), msg.Author.Username, msg.Content,
+			msg.Timestamp.Time().Local().Format(time.Kitchen),
+			msg.Author.Username, msg.Content,
 		)
 	}
 
 	p.mutex.Lock()
 	p.channelID = discord.ChannelID(id)
 	p.mutex.Unlock()
+}
+
+func (p *Prompt) joinInvite(body string) {
+	joined, err := p.State.JoinInvite(body)
+	if err != nil {
+		p.writeError(errors.Wrap(err, "failed to join invite"))
+		return
+	}
+
+	if joined.Channel.ID.IsValid() {
+		p.mutex.Lock()
+		p.channelID = joined.Channel.ID
+		p.mutex.Unlock()
+	}
+
+	fmt.Fprintf(
+		p, "Joined guild %q (%d) into channel %q (%d).",
+		joined.Guild.Name, joined.Guild.ID, joined.Channel.Name, joined.Channel.ID,
+	)
+}
+
+func (p *Prompt) createInvite(body string) {
+	parts := strings.SplitN(body, " ", 2)
+
+	p.mutex.Lock()
+	inviteChannel := p.channelID
+	p.mutex.Unlock()
+
+	var inviteData api.CreateInviteData
+
+	if parts[0] != "" {
+		id, err := discord.ParseSnowflake(parts[0])
+		if err != nil {
+			p.writeError(errors.Wrap(err, "failed to parse channelID"))
+			return
+		}
+		inviteChannel = discord.ChannelID(id)
+	}
+
+	if len(parts) == 2 {
+		if err := json.Unmarshal([]byte(parts[1]), &inviteData); err != nil {
+			p.writeError(errors.Wrap(err, "failed to parse invite data JSON"))
+			return
+		}
+	}
+
+	inv, err := p.State.CreateInvite(inviteChannel, inviteData)
+	if err != nil {
+		p.writeError(errors.Wrap(err, "failed to create invite"))
+		return
+	}
+
+	fmt.Fprintf(p, "Invite created: %q\n", inv.Code)
 }
