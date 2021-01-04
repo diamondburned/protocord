@@ -4,17 +4,15 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
-	"io"
 	"log"
 	"strings"
 	"sync"
 	"time"
 
-	"github.com/chzyer/readline"
+	"github.com/c-bata/go-prompt"
 	"github.com/diamondburned/arikawa/api"
 	"github.com/diamondburned/arikawa/discord"
 	"github.com/diamondburned/arikawa/gateway"
-	"github.com/diamondburned/arikawa/state"
 	"github.com/pkg/errors"
 )
 
@@ -38,55 +36,37 @@ func main() {
 		log.Fatalln("failed to connect:", err)
 	}
 
-	p, err := NewPrompt(s)
-	if err != nil {
-		log.Fatalln("failed to create prompt:", err)
-	}
-
-	if err := p.Run(); err != nil {
-		log.Fatalln("failed to run readline:", err)
-	}
-}
-
-func connect(token string) (*state.State, error) {
-	s, err := state.New(token)
-	if err != nil {
-		return nil, errors.Wrap(err, "failed to create state")
-	}
-
-	if err := s.Open(); err != nil {
-		return nil, errors.Wrap(err, "failed to open")
-	}
-
-	return s, nil
+	p := NewPrompt(s)
+	p.Run()
 }
 
 type Prompt struct {
-	*readline.Instance
+	writeMu sync.Mutex
+	writer  prompt.ConsoleWriter
 
-	State *state.State
+	prompt *prompt.Prompt
+	state  *State
 
-	mutex     sync.Mutex
-	channelID discord.ChannelID
+	lastTyped time.Time
 }
 
-func NewPrompt(s *state.State) (*Prompt, error) {
-	p, err := readline.New("> ")
-	if err != nil {
-		return nil, errors.Wrap(err, "failed to read prompt")
+func NewPrompt(s *State) *Prompt {
+	p := Prompt{
+		writer: prompt.NewStdoutWriter(),
+		state:  s,
 	}
 
-	prompt := Prompt{
-		Instance: p,
-		State:    s,
-	}
+	p.prompt = prompt.New(
+		p.execute, WrapAutoCompleter(p.state),
+		prompt.OptionTitle("protocord"),
+		prompt.OptionPrefix("> "),
+		prompt.OptionLivePrefix(p.prefix),
+		prompt.OptionWriter(p.writer),
+		prompt.OptionSetExitCheckerOnInput(p.onChange),
+	)
 
 	s.AddHandler(func(msg *gateway.MessageCreateEvent) {
-		prompt.mutex.Lock()
-		channelID := prompt.channelID
-		prompt.mutex.Unlock()
-
-		if channelID != msg.ChannelID {
+		if p.state.ChannelID() != msg.ChannelID {
 			return
 		}
 
@@ -95,19 +75,15 @@ func NewPrompt(s *state.State) (*Prompt, error) {
 			name = msg.Member.Nick
 		}
 
-		fmt.Fprintf(
-			p, "[%s] %s: %s\n",
+		p.Writelnf(
+			"[%s] %s: %s",
 			msg.Timestamp.Time().Local().Format(time.Kitchen),
 			name, msg.Content,
 		)
 	})
 
 	s.AddHandler(func(msg *gateway.MessageUpdateEvent) {
-		prompt.mutex.Lock()
-		channelID := prompt.channelID
-		prompt.mutex.Unlock()
-
-		if channelID != msg.ChannelID {
+		if p.state.ChannelID() != msg.ChannelID {
 			return
 		}
 
@@ -116,106 +92,177 @@ func NewPrompt(s *state.State) (*Prompt, error) {
 			name = msg.Member.Nick
 		}
 
-		fmt.Fprintf(
-			p, "[%s] %s: %s (edited)\n",
+		p.Writelnf(
+			"[%s] %s: %s (edited)",
 			msg.EditedTimestamp.Time().Local().Format(time.Kitchen),
 			name, msg.Content,
 		)
 	})
 
-	return &prompt, nil
+	s.AddHandler(func(t *gateway.TypingStartEvent) {
+		if p.state.ChannelID() != t.ChannelID {
+			return
+		}
+
+		// Lazy mode.
+		if t.Member != nil {
+			var name = t.Member.Nick
+			if name == "" {
+				name = t.Member.User.Username
+			}
+
+			p.WriteColorlnf(
+				prompt.LightGray,
+				"*%s is typing.*", name,
+			)
+		}
+	})
+
+	return &p
 }
 
-func (p *Prompt) Run() error {
-	p.writeLine("Welcome. Try typing '/help'.")
-	for {
-		line, err := p.Readline()
-		if err != nil {
-			if err == io.EOF {
-				return nil
-			}
-			return errors.Wrap(err, "failed to read line")
-		}
+func (p *Prompt) Run() { p.prompt.Run() }
 
-		if !strings.HasPrefix(line, "/") {
-			p.sendMessage(line)
-			continue
-		}
+var commandSuggestions = []prompt.Suggest{
+	{Text: "/help", Description: "Print the help message."},
+	{Text: "/quit", Description: "Quit."},
+	{Text: "/list", Description: "List all servers."},
+	{Text: "/join", Description: "Join a channel."},
+	{Text: "/join-invite", Description: "Join a guild using an invite code."},
+	{Text: "/create-invite", Description: "Create an invite code to the current channel."},
+	{Text: "/create-guild", Description: "Create a new guild"},
+	{Text: "/create-channel", Description: "Create a new channel"},
+}
 
-		parts := strings.SplitN(line, " ", 2)
-		k, v := strings.TrimPrefix(parts[0], "/"), ""
-		if len(parts) == 2 {
-			v = parts[1]
-		}
+func (p *Prompt) execute(line string) {
+	if !strings.HasPrefix(line, "/") {
+		p.sendMessage(line)
+		return
+	}
 
-		switch k {
-		case "help":
-			p.writeLine("To send a message, type in directly.")
-			p.writeLine("Available commands:")
-			p.writeLine("	/list")
-			p.writeLine("	/join <channelID>")
-			p.writeLine("	/join-invite <inviteCode>")
-			p.writeLine("	/create-invite [channelID] [json:createInviteData]")
+	parts := strings.SplitN(line, " ", 2)
+	k, v := strings.TrimPrefix(parts[0], "/"), ""
+	if len(parts) == 2 {
+		v = parts[1]
+	}
 
-		case "list":
-			p.list()
-		case "join":
-			p.join(v)
-		case "join-invite":
-			p.joinInvite(v)
-		case "create-invite":
-			p.createInvite(v)
-		}
+	switch k {
+	case "help":
+		p.WriteLine("To send a message, type in directly.")
+		p.WriteLine("Available commands:")
+		p.WriteLine("	/list")
+		p.WriteLine("	/quit")
+		p.WriteLine("	/join <channelID>")
+		p.WriteLine("	/join-invite <inviteCode>")
+		p.WriteLine("	/create-invite [channelID] [json:createInviteData]")
+		p.WriteLine("	/create-guild")
+		p.WriteLine("	/create-channel")
+
+	case "list":
+		p.list()
+	case "quit":
+		// refer to shouldExit().
+	case "join":
+		p.join(v)
+	case "join-invite":
+		p.joinInvite(v)
+	case "create-invite":
+		p.createInvite(v)
+	case "create-guild":
+		p.createGuild(v)
+	case "create-channel":
+		p.createChannel(v)
 	}
 }
 
-func (p *Prompt) writeError(err error) {
-	io.WriteString(p, "Error: "+err.Error()+"\n")
+func (p *Prompt) prefix() (prefix string, use bool) {
+	name := p.state.ChannelName()
+	return fmt.Sprintf("[#%s] ", name), name != ""
 }
 
-func (p *Prompt) writeLine(line string) {
-	io.WriteString(p, line+"\n")
+const typeFrequency = 8 * time.Second
+
+func (p *Prompt) onChange(in string, broke bool) (quit bool) {
+	// go-prompt is an awful library.
+	if broke {
+		return in == "/quit"
+	}
+
+	if id := p.state.ChannelID(); id.IsValid() {
+		now := time.Now()
+
+		if p.lastTyped.Add(typeFrequency).Before(now) {
+			p.lastTyped = now
+			go p.state.Typing(id)
+		}
+	}
+
+	return false
+}
+
+func (p *Prompt) WriteError(err error) {
+	p.writeMu.Lock()
+	defer p.writeMu.Unlock()
+
+	p.writer.SetColor(prompt.DarkRed, prompt.DefaultColor, false)
+	p.writer.WriteStr("Error: " + err.Error() + "\n")
+	p.writer.SetColor(prompt.DefaultColor, prompt.DefaultColor, false)
+}
+
+func (p *Prompt) WriteLine(line string) {
+	p.writeMu.Lock()
+	defer p.writeMu.Unlock()
+
+	p.writer.WriteStr(line + "\n")
+}
+
+func (p *Prompt) Writelnf(f string, v ...interface{}) {
+	p.writeMu.Lock()
+	defer p.writeMu.Unlock()
+
+	p.writer.WriteStr(fmt.Sprintf(f+"\n", v...))
+}
+
+func (p *Prompt) WriteColorlnf(color prompt.Color, f string, v ...interface{}) {
+	p.writeMu.Lock()
+	defer p.writeMu.Unlock()
+
+	p.writer.SetColor(color, prompt.DefaultColor, false)
+	p.writer.WriteStr(fmt.Sprintf(f+"\n", v...))
+	p.writer.SetColor(prompt.DefaultColor, prompt.DefaultColor, false)
 }
 
 func (p *Prompt) sendMessage(body string) {
-	p.mutex.Lock()
-	channelID := p.channelID
-	p.mutex.Unlock()
-
+	channelID := p.state.ChannelID()
 	if !channelID.IsValid() {
-		p.writeError(errors.New("not in any channel"))
+		p.WriteError(errors.New("not in any channel"))
 		return
 	}
 
-	if body == "" {
-		p.writeError(errors.New("missing message content"))
-		return
-	}
-
-	_, err := p.State.SendText(channelID, body)
+	_, err := p.state.SendText(channelID, body)
 	if err != nil {
-		p.writeError(err)
+		p.WriteError(err)
 	}
 }
 
 func (p *Prompt) list() {
-	guilds, err := p.State.Guilds()
+	guilds, err := p.state.Guilds()
 	if err != nil {
-		p.writeError(errors.Wrap(err, "failed to list all guilds"))
+		p.WriteError(errors.Wrap(err, "failed to list all guilds"))
 		return
 	}
 
 	for _, guild := range guilds {
-		channels, err := p.State.Channels(guild.ID)
+		channels, err := p.state.Channels(guild.ID)
 		if err != nil {
-			p.writeError(errors.Wrap(err, "failed to get channels"))
+			p.WriteError(errors.Wrap(err, "failed to get channels"))
 			continue
 		}
 
-		fmt.Fprintf(p, "Guild %d: %q:\n", guild.ID, guild.Name)
+		p.Writelnf("Guild %d: %q:", guild.ID, guild.Name)
 
 		for _, ch := range channels {
-			fmt.Fprintf(p, "\t- %d: %q\n", ch.ID, ch.Name)
+			p.Writelnf("    - %d: %q", ch.ID, ch.Name)
 		}
 	}
 }
@@ -223,63 +270,74 @@ func (p *Prompt) list() {
 func (p *Prompt) join(body string) {
 	id, err := discord.ParseSnowflake(body)
 	if err != nil {
-		p.writeError(errors.Wrap(err, "failed to parse channel ID"))
+		p.WriteError(errors.Wrap(err, "failed to parse channel ID"))
 		return
 	}
 
-	msgs, err := p.State.Messages(discord.ChannelID(id))
+	ch, err := p.state.Channel(discord.ChannelID(id))
 	if err != nil {
-		p.writeError(errors.Wrap(err, "invalid channel"))
+		p.WriteError(errors.Wrap(err, "invalid channel"))
+		return
+	}
+
+	msgs, err := p.state.Messages(ch.ID)
+	if err != nil {
+		p.WriteError(errors.Wrap(err, "failed to get messages"))
 		return
 	}
 
 	for i := len(msgs) - 1; i >= 0; i-- {
 		msg := msgs[i]
 
-		fmt.Fprintf(
-			p, "[%s] %s: %s\n",
+		p.Writelnf(
+			"[%s] %s: %s",
 			msg.Timestamp.Time().Local().Format(time.Kitchen),
 			msg.Author.Username, msg.Content,
 		)
 	}
 
-	p.mutex.Lock()
-	p.channelID = discord.ChannelID(id)
-	p.mutex.Unlock()
+	p.state.mutex.Lock()
+	p.state.channelName = ch.Name
+	p.state.channelID = ch.ID
+	p.state.guildID = ch.GuildID
+	p.state.mutex.Unlock()
+
+	if ch.GuildID.IsValid() {
+		p.state.MemberState.Subscribe(ch.GuildID)
+	}
 }
 
 func (p *Prompt) joinInvite(body string) {
-	joined, err := p.State.JoinInvite(body)
+	joined, err := p.state.JoinInvite(body)
 	if err != nil {
-		p.writeError(errors.Wrap(err, "failed to join invite"))
+		p.WriteError(errors.Wrap(err, "failed to join invite"))
 		return
 	}
 
 	if joined.Channel.ID.IsValid() {
-		p.mutex.Lock()
-		p.channelID = joined.Channel.ID
-		p.mutex.Unlock()
+		p.state.mutex.Lock()
+		p.state.channelName = joined.Channel.Name
+		p.state.channelID = joined.Channel.ID
+		p.state.guildID = joined.Guild.ID
+		p.state.mutex.Unlock()
 	}
 
-	fmt.Fprintf(
-		p, "Joined guild %q (%d) into channel %q (%d).",
+	p.Writelnf(
+		"Joined guild %q (%d) into channel %q (%d).",
 		joined.Guild.Name, joined.Guild.ID, joined.Channel.Name, joined.Channel.ID,
 	)
 }
 
 func (p *Prompt) createInvite(body string) {
 	parts := strings.SplitN(body, " ", 2)
-
-	p.mutex.Lock()
-	inviteChannel := p.channelID
-	p.mutex.Unlock()
+	inviteChannel := p.state.ChannelID()
 
 	var inviteData api.CreateInviteData
 
 	if parts[0] != "" {
 		id, err := discord.ParseSnowflake(parts[0])
 		if err != nil {
-			p.writeError(errors.Wrap(err, "failed to parse channelID"))
+			p.WriteError(errors.Wrap(err, "failed to parse channelID"))
 			return
 		}
 		inviteChannel = discord.ChannelID(id)
@@ -287,16 +345,40 @@ func (p *Prompt) createInvite(body string) {
 
 	if len(parts) == 2 {
 		if err := json.Unmarshal([]byte(parts[1]), &inviteData); err != nil {
-			p.writeError(errors.Wrap(err, "failed to parse invite data JSON"))
+			p.WriteError(errors.Wrap(err, "failed to parse invite data JSON"))
 			return
 		}
 	}
 
-	inv, err := p.State.CreateInvite(inviteChannel, inviteData)
+	inv, err := p.state.CreateInvite(inviteChannel, inviteData)
 	if err != nil {
-		p.writeError(errors.Wrap(err, "failed to create invite"))
+		p.WriteError(errors.Wrap(err, "failed to create invite"))
 		return
 	}
 
-	fmt.Fprintf(p, "Invite created: %q\n", inv.Code)
+	p.Writelnf("Invite created: %q", inv.Code)
+}
+
+func (p *Prompt) createGuild(body string) {
+	g, err := p.state.CreateGuild(api.CreateGuildData{
+		Name: body,
+	})
+	if err != nil {
+		p.WriteError(errors.Wrap(err, "failed to create guild"))
+		return
+	}
+
+	p.Writelnf("Guild with ID %d created", g.ID)
+}
+
+func (p *Prompt) createChannel(body string) {
+	ch, err := p.state.CreateChannel(p.state.GuildID(), api.CreateChannelData{
+		Name: body,
+	})
+	if err != nil {
+		p.WriteError(errors.Wrap(err, "failed to create channel"))
+		return
+	}
+
+	p.Writelnf("Channel with ID %d created", ch.ID)
 }
